@@ -169,52 +169,72 @@ bundle_sim <- function(
   }
 
   # Build iteration function
+  #
+  # NOTE: The body is assembled programmatically with as.call()/call() rather
+  # than written out as a literal function and then patched by AST position.
+  # Positional patching (e.g. `body(f)[[3]][[3]][[5]] <- id`) breaks under
+  # code-coverage instrumentation: covr rewrites every expression as
+  # `if (TRUE) { covr:::count(...); <expr> }`, which shifts every index and
+  # made the whole test suite error out under covr. Building the calls from
+  # symbols keeps them opaque to instrumentation. See issue #20.
 
-  bundled_sim <- function(reps, seed, summarize) {
+  # { dat <- eval(gen_cl); eval(ana_cl) }
+  rep_block <- as.call(list(
+    quote(`{`),
+    call("<-", quote(dat), quote(eval(gen_cl))),
+    quote(eval(ana_cl))
+  ))
 
-    if (!is.na(seed)) {
-      set.seed(seed)
-    }
+  # res <- simhelpers::repeat_and_stack(<reps_name>, <rep_block>,
+  #                                     stack = <stack_reps>, id = <id>)
+  rep_args <- list(
+    quote(simhelpers::repeat_and_stack),
+    as.symbol(reps_name),
+    rep_block,
+    stack = stack_reps
+  )
+  # `id` is omitted entirely when NULL, matching repeat_and_stack()'s default
+  if (!is.null(id)) rep_args$id <- id
+  rep_cl <- call("<-", quote(res), as.call(rep_args))
 
-    res <- simhelpers::repeat_and_stack(reps, {
-      dat <- eval(gen_cl)
-      eval(ana_cl)
-    }, stack = TRUE, id = NULL)
+  body_exprs <- list(quote(`{`))
 
-    if (summarize) {
-      res <- eval(sum_cl)
-    }
-
-    return(res)
+  # seed handling: dropped altogether when `seed_name` is NULL
+  if (!is.null(seed_name)) {
+    seed_sym <- as.symbol(seed_name)
+    body_exprs <- c(body_exprs, list(
+      call(
+        "if",
+        call("!", call("is.na", seed_sym)),
+        as.call(list(quote(`{`), call("set.seed", seed_sym)))
+      )
+    ))
   }
 
+  body_exprs <- c(body_exprs, list(rep_cl))
+
+  # summarize handling: dropped when `f_summarize` is NULL, made unconditional
+  # when `summarize_opt_name` is NULL
+  if (!is.null(f_summarize)) {
+    sum_assign <- call("<-", quote(res), quote(eval(sum_cl)))
+    if (is.null(summarize_opt_name)) {
+      body_exprs <- c(body_exprs, list(sum_assign))
+    } else {
+      body_exprs <- c(body_exprs, list(
+        call(
+          "if",
+          as.symbol(summarize_opt_name),
+          as.call(list(quote(`{`), sum_assign))
+        )
+      ))
+    }
+  }
+
+  body_exprs <- c(body_exprs, list(quote(return(res))))
+
+  bundled_sim <- function() NULL
   formals(bundled_sim) <- full_args
-
-  # adjust reps_name
-  body(bundled_sim)[[3]][[3]][[2]] <- as.symbol(reps_name)
-
-  # adjust stack_reps
-  body(bundled_sim)[[3]][[3]][[4]] <- stack_reps
-
-  # adjust id variable
-  body(bundled_sim)[[3]][[3]][[5]] <- id
-
-  # adjust summarize_opt_name
-  if (is.null(f_summarize)) {
-    body(bundled_sim)[[4]] <- NULL
-  } else if (is.null(summarize_opt_name)) {
-    body(bundled_sim)[[4]] <- body(bundled_sim)[[4]][[3]][[2]]
-  } else {
-    body(bundled_sim)[[4]][[2]] <- as.symbol(summarize_opt_name)
-  }
-
-  # adjust seed_name
-  if (is.null(seed_name)) {
-    body(bundled_sim)[[2]] <- NULL
-  } else {
-    body(bundled_sim)[[2]][[2]][[2]][[2]] <- as.symbol(seed_name)
-    body(bundled_sim)[[2]][[3]][[2]][[2]] <- as.symbol(seed_name)
-  }
+  body(bundled_sim) <- as.call(body_exprs)
 
   return(bundled_sim)
 }
